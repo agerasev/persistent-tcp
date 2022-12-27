@@ -1,0 +1,26 @@
+[package]
+name = "persistent-tcp"
+version = "0.1.0"
+authors = ["Alexey Gerasev <alexey.gerasev@gmail.com>"]
+edition = "2021"
+
+description = "TCP stream that tries to reconnect when disconnected"
+documentation = "https://docs.rs/persistent-tcp"
+homepage = "https://github.com/agerasev/persistent-tcp"
+repository = "https://github.com/agerasev/persistent-tcp.git"
+readme = "README.md"
+keywords = ["async", "tcp", "persistent", "reconnect"]
+categories = ["asynchronous", "network-programming"]
+license = "MIT/Apache-2.0"
+
+[features]
+default = ["tokio"]
+
+[dependencies]
+log = "0.4.17"
+
+[dependencies.tokio]
+version = "1.23.0"
+optional = true
+default-features = false
+features = ["net", "rt", "time", "macros"]
