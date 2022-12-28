@@ -14,10 +14,19 @@ categories = ["asynchronous", "network-programming"]
 license = "MIT/Apache-2.0"
 
 [features]
-default = ["tokio"]
+default = ["async-std", "tokio"]
 
 [dependencies]
 log = "0.4.17"
+
+[dependencies.futures]
+version = "0.3.25"
+default-features = false
+features = ["std", "async-await"]
+
+[dependencies.async-std]
+version = "1.12.0"
+optional = true
 
 [dependencies.tokio]
 version = "1.23.0"

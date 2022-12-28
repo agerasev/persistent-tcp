@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "async-std")]
+mod async_std;
 #[cfg(feature = "tokio")]
 mod tokio;
 
@@ -17,6 +19,6 @@ struct Internal<S: Sized> {
 }
 
 #[derive(Clone)]
-pub struct PersistentTcpStream<S: Sized> {
+pub struct Persistent<S: Sized> {
     shared: Arc<Internal<S>>,
 }
