@@ -11,6 +11,9 @@ mod async_std;
 #[cfg(feature = "tokio")]
 mod tokio;
 
+#[cfg(all(test, not(feature = "test")))]
+compile_error!("Feature 'test' must be enabled when building tests");
+
 const CONN_POLL_PERIOD: Duration = Duration::from_millis(100);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(4000);
 
@@ -40,6 +43,15 @@ impl<S: Socket> Unpin for Persistent<S> {}
 impl<S: Socket> Persistent<S> {
     pub fn connected(&mut self) -> Connected<S> {
         Connected { owner: self }
+    }
+
+    async fn connected_socket(&mut self) -> &mut S {
+        self.connected().await;
+        if let State::Ready(socket) = &mut self.state {
+            socket
+        } else {
+            unreachable!()
+        }
     }
 }
 

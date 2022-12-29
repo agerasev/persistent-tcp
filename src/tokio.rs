@@ -37,7 +37,7 @@ async fn connect<A: ToSocketAddrs + Clone + Debug + Send>(addrs: A) -> TcpStream
         let addrs_ = addrs.clone();
         match try_connect(addrs_).await {
             Ok(stream) => {
-                log::debug!("Socket connected");
+                log::debug!("Socket future");
                 break stream;
             }
             Err(err) => {
@@ -66,14 +66,10 @@ impl AsyncRead for Persistent<TcpStream> {
     ) -> Poll<io::Result<()>> {
         log::trace!("Socket read");
 
-        let connected = self.connected();
-        pin_mut!(connected);
-        ready!(connected.poll(cx));
-
-        let stream = if let State::Ready(socket) = &mut self.state {
-            socket
-        } else {
-            unreachable!()
+        let stream = {
+            let future = self.connected_socket();
+            pin_mut!(future);
+            ready!(future.poll(cx))
         };
 
         let len = buf.filled().len();
@@ -105,14 +101,10 @@ impl AsyncWrite for Persistent<TcpStream> {
     ) -> Poll<io::Result<usize>> {
         log::trace!("Socket write");
 
-        let connected = self.connected();
-        pin_mut!(connected);
-        ready!(connected.poll(cx));
-
-        let stream = if let State::Ready(socket) = &mut self.state {
-            socket
-        } else {
-            unreachable!()
+        let stream = {
+            let future = self.connected_socket();
+            pin_mut!(future);
+            ready!(future.poll(cx))
         };
 
         let result = ready!(Pin::new(stream).poll_write(cx, buf)).and_then(|len| {
@@ -177,7 +169,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         const ADDR: &str = "127.0.0.1:57249";
-        const ATTEMPTS: u32 = 64;
+        const ATTEMPTS: u32 = 256;
 
         let rt = runtime::Handle::current();
         let server = rt.spawn(async {

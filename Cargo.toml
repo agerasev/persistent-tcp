@@ -14,8 +14,8 @@ categories = ["asynchronous", "network-programming"]
 license = "MIT/Apache-2.0"
 
 [features]
-default = ["tokio", "test"]
-test = ["tokio/io-util", "env_logger"]
+default = ["async-std", "tokio", "test"]
+test = ["async-std/attributes", "tokio/io-util", "env_logger"]
 
 [dependencies]
 log = "0.4.17"
