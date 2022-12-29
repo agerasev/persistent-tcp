@@ -1,121 +1,97 @@
-use futures::task::AtomicWaker;
+use futures::{pin_mut, ready};
 use std::{
+    fmt::Debug,
+    future::Future,
     io,
-    ops::Deref,
+    mem::replace,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, Weak,
-    },
     task::{Context, Poll},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{lookup_host, TcpStream, ToSocketAddrs},
-    runtime, select,
+    net::{TcpStream, ToSocketAddrs},
+    select,
     time::sleep,
 };
 
-use crate::{Internal, Persistent, CONNECT_TIMEOUT, CONN_POLL_PERIOD};
+use crate::{Persistent, Socket, State, CONNECT_TIMEOUT, CONN_POLL_PERIOD};
 
-impl Persistent<TcpStream> {
-    pub async fn connect<A: ToSocketAddrs>(addrs: A) -> io::Result<Self> {
-        let shared = Arc::new(Internal {
-            addrs: lookup_host(addrs).await?.collect(),
-            stream: Mutex::new(None),
-            waker: AtomicWaker::new(),
-            down: AtomicBool::new(false),
-            recount: AtomicUsize::new(0),
-        });
-        runtime::Handle::current().spawn(Internal::connect_loop(Arc::downgrade(&shared)));
-        Ok(Self { shared })
+impl Socket for TcpStream {}
+
+async fn try_connect<A: ToSocketAddrs>(addrs: A) -> io::Result<TcpStream> {
+    select! {
+        biased;
+        result = TcpStream::connect(addrs) => result,
+        () = sleep(CONNECT_TIMEOUT) => {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Connect timed out",
+            ))
+        }
     }
 }
 
-impl Internal<TcpStream> {
-    async fn connect_once(&self) -> io::Result<TcpStream> {
-        TcpStream::connect(self.addrs.deref()).await
-    }
-
-    async fn connect_loop(weak: Weak<Self>) {
-        loop {
-            log::trace!("Connect loop");
-            let this = match weak.upgrade() {
-                Some(strong) => strong,
-                None => break,
-            };
-            if this.is_down() {
-                break;
+async fn connect<A: ToSocketAddrs + Clone + Debug + Send>(addrs: A) -> TcpStream {
+    loop {
+        log::trace!("Connect loop");
+        let addrs_ = addrs.clone();
+        match try_connect(addrs_).await {
+            Ok(stream) => {
+                log::debug!("Socket connected");
+                break stream;
             }
-            if this.stream.lock().unwrap().is_none() {
-                if this.is_down() {
-                    break;
-                }
-                match select! {
-                    biased;
-                    result = this.connect_once() => result,
-                    () = sleep(CONNECT_TIMEOUT) => {
-                        log::warn!("Connecting to {:?} timed out", this.addrs.deref());
-                        continue;
-                    }
-                } {
-                    Ok(stream) => {
-                        assert!(this.stream.lock().unwrap().replace(stream).is_none());
-                        this.waker.wake();
-                        log::info!("Socket connected");
-                    }
-                    Err(err) => {
-                        log::warn!("Error connecting to {:?}: {}", this.addrs.deref(), err)
-                    }
-                }
+            Err(err) => {
+                log::warn!("Error connecting to {:?}: {}", addrs, err)
             }
-            sleep(CONN_POLL_PERIOD).await;
         }
-        log::info!("Connect loop stopped");
+        sleep(CONN_POLL_PERIOD).await;
+    }
+}
+
+impl Persistent<TcpStream> {
+    /// Create persistent socket without waiting for connection.
+    pub fn new<A: ToSocketAddrs + Clone + Debug + Send + 'static>(addrs: A) -> Self {
+        Self {
+            connect: Box::new(move || Box::pin(connect(addrs.clone()))),
+            state: State::Empty,
+        }
     }
 }
 
 impl AsyncRead for Persistent<TcpStream> {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         log::trace!("Socket read");
-        self.shared.waker.register(cx.waker());
-        let mut guard = self.shared.stream.lock().unwrap();
-        match guard.take() {
-            Some(mut stream) => {
-                let len = buf.filled().len();
-                match Pin::new(&mut stream).poll_read(cx, buf) {
-                    Poll::Ready(result) => match result.and_then(|()| {
-                        if buf.filled().len() > len {
-                            Ok(())
-                        } else {
-                            Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "Remote host closed connection",
-                            ))
-                        }
-                    }) {
-                        Ok(()) => {
-                            guard.replace(stream);
-                            Poll::Ready(Ok(()))
-                        }
-                        Err(err) => {
-                            log::warn!("Socket read error: {}", err);
-                            Poll::Pending
-                        }
-                    },
-                    Poll::Pending => {
-                        guard.replace(stream);
-                        Poll::Pending
-                    }
-                }
+
+        let connected = self.connected();
+        pin_mut!(connected);
+        ready!(connected.poll(cx));
+
+        let stream = if let State::Ready(socket) = &mut self.state {
+            socket
+        } else {
+            unreachable!()
+        };
+
+        let len = buf.filled().len();
+        let result = ready!(Pin::new(stream).poll_read(cx, buf)).and_then(|()| {
+            if buf.filled().len() > len {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Remote host closed connection",
+                ))
             }
-            None => {
-                log::warn!("No connection established at the time");
-                Poll::Pending
+        });
+        match result {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(err) => {
+                self.state = State::Empty;
+                Poll::Ready(Err(err))
             }
         }
     }
@@ -123,97 +99,65 @@ impl AsyncRead for Persistent<TcpStream> {
 
 impl AsyncWrite for Persistent<TcpStream> {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         log::trace!("Socket write");
-        self.shared.waker.register(cx.waker());
-        let mut guard = self.shared.stream.lock().unwrap();
-        match guard.take() {
-            Some(mut stream) => match Pin::new(&mut stream).poll_write(cx, buf) {
-                Poll::Ready(result) => match result.and_then(|len| {
-                    if len > 0 {
-                        Ok(len)
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "Remote host closed connection",
-                        ))
-                    }
-                }) {
-                    Ok(len) => {
-                        guard.replace(stream);
-                        Poll::Ready(Ok(len))
-                    }
-                    Err(err) => {
-                        log::warn!("Socket write error: {}", err);
-                        Poll::Pending
-                    }
-                },
-                Poll::Pending => {
-                    guard.replace(stream);
-                    Poll::Pending
-                }
-            },
-            None => {
-                log::warn!("No connection established at the time");
-                Poll::Pending
+
+        let connected = self.connected();
+        pin_mut!(connected);
+        ready!(connected.poll(cx));
+
+        let stream = if let State::Ready(socket) = &mut self.state {
+            socket
+        } else {
+            unreachable!()
+        };
+
+        let result = ready!(Pin::new(stream).poll_write(cx, buf)).and_then(|len| {
+            if len > 0 {
+                Ok(len)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Remote host closed connection",
+                ))
+            }
+        });
+        match result {
+            Ok(len) => Poll::Ready(Ok(len)),
+            Err(err) => {
+                self.state = State::Empty;
+                Poll::Ready(Err(err))
             }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         log::trace!("Socket flush");
-        let mut guard = self.shared.stream.lock().unwrap();
-        match guard.take() {
-            Some(mut stream) => match Pin::new(&mut stream).poll_flush(cx) {
-                Poll::Ready(result) => Poll::Ready(match result {
-                    Ok(()) => {
-                        guard.replace(stream);
-                        Ok(())
-                    }
-                    Err(err) => {
-                        log::warn!("Socket flush error: {}", err);
-                        Ok(())
-                    }
-                }),
-                Poll::Pending => {
-                    guard.replace(stream);
-                    Poll::Pending
+        if let State::Ready(mut stream) = replace(&mut self.state, State::Empty) {
+            match ready!(Pin::new(&mut stream).poll_flush(cx)) {
+                Ok(()) => {
+                    self.state = State::Ready(stream);
+                    Poll::Ready(Ok(()))
                 }
-            },
-            None => {
-                log::warn!("No connection established at the time");
-                Poll::Ready(Ok(()))
+                Err(err) => Poll::Ready(Err(err)),
             }
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         log::trace!("Socket shutdown");
-        let mut guard = self.shared.stream.lock().unwrap();
-        match guard.take() {
-            Some(mut stream) => match Pin::new(&mut stream).poll_shutdown(cx) {
-                Poll::Ready(result) => {
-                    self.shared.down.store(true, Ordering::Release);
-                    Poll::Ready(match result {
-                        Ok(()) => Ok(()),
-                        Err(err) => {
-                            log::error!("Shutdown failed: {}", err);
-                            Ok(())
-                        }
-                    })
-                }
-                Poll::Pending => {
-                    guard.replace(stream);
-                    Poll::Pending
-                }
-            },
-            None => {
-                self.shared.down.store(true, Ordering::Release);
-                Poll::Ready(Ok(()))
+        if let State::Ready(mut stream) = replace(&mut self.state, State::Empty) {
+            match ready!(Pin::new(&mut stream).poll_shutdown(cx)) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(err) => Poll::Ready(Err(err)),
             }
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 }
@@ -221,6 +165,7 @@ impl AsyncWrite for Persistent<TcpStream> {
 #[cfg(all(test, feature = "test"))]
 mod tests {
     use crate::Persistent;
+    use std::io::ErrorKind;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -237,6 +182,7 @@ mod tests {
         let rt = runtime::Handle::current();
         let server = rt.spawn(async {
             let listener = TcpListener::bind(ADDR).await.unwrap();
+            listener.accept().await.unwrap().0.shutdown().await.unwrap();
             for i in 0..ATTEMPTS {
                 let (mut server, _) = listener.accept().await.unwrap();
                 server.write_u32(i).await.unwrap();
@@ -248,8 +194,12 @@ mod tests {
             }
         });
         let client = rt.spawn(async {
-            let mut client = Persistent::<TcpStream>::connect(ADDR).await.unwrap();
+            let mut client = Persistent::<TcpStream>::new(ADDR);
             for i in 0..ATTEMPTS {
+                assert_eq!(
+                    client.read_u32().await.err().unwrap().kind(),
+                    ErrorKind::ConnectionAborted
+                );
                 assert_eq!(client.read_u32().await.unwrap(), i);
                 client.write_u32(ATTEMPTS - i).await.unwrap();
                 client.flush().await.unwrap();

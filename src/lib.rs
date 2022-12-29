@@ -1,10 +1,8 @@
-use futures::task::AtomicWaker;
+use futures::{Future, FutureExt};
 use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    mem::replace,
+    pin::Pin,
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -16,12 +14,14 @@ mod tokio;
 const CONN_POLL_PERIOD: Duration = Duration::from_millis(100);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(4000);
 
-struct Internal<S> {
-    addrs: Vec<SocketAddr>,
-    stream: Mutex<Option<S>>,
-    waker: AtomicWaker,
-    down: AtomicBool,
-    recount: AtomicUsize,
+pub trait Socket: Send + Unpin + Sized {}
+
+type Connect<S> = Pin<Box<dyn Future<Output = S> + Send>>;
+
+enum State<S: Socket> {
+    Empty,
+    Connecting(Connect<S>),
+    Ready(S),
 }
 
 /// Persistense wrapper for TCP stream.
@@ -30,20 +30,50 @@ struct Internal<S> {
 ///
 /// *It does not guarantee that all data sent to the server will arrive.*
 /// *To ensure that you need to use some higher-level protocol.*
-#[derive(Clone)]
-pub struct Persistent<S> {
-    shared: Arc<Internal<S>>,
+pub struct Persistent<S: Socket> {
+    connect: Box<dyn Fn() -> Connect<S> + Send>,
+    state: State<S>,
 }
 
-impl<S> Internal<S> {
-    fn is_down(&self) -> bool {
-        self.down.load(Ordering::Acquire)
-    }
+impl<S: Socket> Unpin for Persistent<S> {}
 
-    /// Number of successfull connection attempts.
-    ///
-    /// Change of this value may signal about potential data loss.
-    pub fn connect_count(&self) -> usize {
-        self.recount.load(Ordering::Acquire)
+impl<S: Socket> Persistent<S> {
+    pub fn connected(&mut self) -> Connected<S> {
+        Connected { owner: self }
+    }
+}
+
+pub struct Connected<'a, S: Socket> {
+    owner: &'a mut Persistent<S>,
+}
+
+impl<'a, S: Socket> Unpin for Connected<'a, S> {}
+
+impl<'a, S: Socket> Future for Connected<'a, S> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut self.owner;
+        let socket = {
+            let state = replace(&mut this.state, State::Empty);
+            if let State::Ready(socket) = state {
+                socket
+            } else {
+                let mut connect = match state {
+                    State::Ready(..) => unreachable!(),
+                    State::Connecting(connect) => connect,
+                    State::Empty => (this.connect)(),
+                };
+                match connect.poll_unpin(cx) {
+                    Poll::Ready(socket) => socket,
+                    Poll::Pending => {
+                        this.state = State::Connecting(connect);
+                        return Poll::Pending;
+                    }
+                }
+            }
+        };
+        this.state = State::Ready(socket);
+        Poll::Ready(())
     }
 }
